@@ -1,22 +1,200 @@
 ---
-title: "Bicep Curl Form"
+title: "Detecting Proper Bicep Curls"
 author: "doctorpacket"
 date: "07/21/2015"
 output: html_document
 ---
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+## Synopsis
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+The purpose of this machine learning algorithm is to detect whether bicep curls are performed with proper form.
+
+## Experiment Setup
+
+Readings from 4 sensors placed on the subject's forearm, arm, belt, and dumbbell are obtained.  Using these readings, the algorithm will try to predict whether the subject is performing bicep curls properly.
+
+There are 6 subjects under this experiment.  The bicep curls are performed in the following manner (classe):
+
+- A - proper form
+- B - throwing elbows to the front
+- C - lifting the dumbbell halfway
+- D - lowering the dumbbell halfway
+- E - throwing hips to the front
+
+## Preprocessing the Dataset
+
+```{r cache=T}
+tr <- read.csv('pml-training.csv', stringsAsFactors=F)
+ts <- read.csv('pml-testing.csv', stringsAsFactors=F)
+```
+
+There are a total of 160 variables, some of which are not useful for our prediction.  For example, aggregate results such as the average/variance/standard deviation are not present in the test set, and should be removed from the training process.
 
 ```{r}
-summary(cars)
+dim(tr)
+apply(tr, MARGIN=2, FUN=function(col) {sum(is.na(col))})
 ```
 
-You can also embed plots, for example:
+Looking at the test set, we also see that the data are disparate sample points in time, which greatly limits our ability to predict the classification as a function of time.  Hence, we will remove the time-related columns.
 
-```{r, echo=FALSE}
-plot(cars)
+```{r}
+extractPredictors <- function(df) {
+    ret <- df[,-grep('^(kurtosis|amplitude|skewness|min|max|avg|var|stddev)', colnames(df))]
+    ret <- subset(ret, select=-c(cvtd_timestamp, new_window, num_window, raw_timestamp_part_1, raw_timestamp_part_2))
+    ret
+}
+
+tr <- extractPredictors(tr)
+tr$classe <- as.factor(tr$classe)
+ts <- extractPredictors(ts)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+## Data Analysis
+
+Our first consideration is whether to apply a universal model to all test subjects.  Due to differences in height, weight, body structure, and muscular strength, it is possible that each person would exhibit a unique pattern in sensor readings.  We plot a number of readings across test subjects and classe to verify our intuition:
+
+```{r fig.width=10}
+library(ggplot2)
+
+ggplot(tr, aes(x=X, y=roll_forearm, col=classe)) + geom_point() + facet_wrap(~user_name)
+ggplot(tr, aes(x=X, y=roll_arm, col=classe)) + geom_point() + facet_wrap(~user_name)
+ggplot(tr, aes(x=X, y=roll_belt, col=classe)) + geom_point() + facet_wrap(~user_name)
+ggplot(tr, aes(x=X, y=roll_dumbbell, col=classe)) + geom_point() + facet_wrap(~user_name)
+```
+
+From the plots, it seems that each test subject has a unique way of performing bicep curl, so a personalized model will be taliored for each person.
+
+Also from the plots, we see that the sensors on Adelmo's forearm and Jeremy's arm seem to be malfunctioning:
+
+```{r}
+summary(tr[tr$user_name=='adelmo', c('roll_forearm','pitch_forearm','yaw_forearm')])
+summary(tr[tr$user_name=='jeremy', c('roll_arm','pitch_arm','yaw_arm')])
+```
+
+Hence, we will remove the forearm-related readings from Adelmo's dataset, and arm-related readings from Jeremy's dataset.
+ 
+We will remove the user_name column (as we're fitting one model per person), and the X column (which is simply the sample number):
+
+```{r}
+preprocessAdelmo <- function(df) {
+    df <- subset(df, select=-c(X, user_name))
+    df <- subset(df, select=-c(roll_forearm, pitch_forearm, yaw_forearm))
+    df
+}
+
+preprocessJeremy <- function(df) {
+    df <- subset(df, select=-c(X, user_name))
+    df <- subset(df, select=-c(roll_arm, pitch_arm, yaw_arm))
+    df
+}
+
+preprocess <- function(df) {
+    df <- subset(df, select=-c(X, user_name))   
+    df
+}
+
+tr_adelmo <- preprocessAdelmo(tr[tr$user_name=='adelmo',])
+ts_adelmo <- preprocessAdelmo(ts[ts$user_name=='adelmo',])
+
+tr_carlitos <- preprocess(tr[tr$user_name=='carlitos',])
+ts_carlitos <- preprocess(ts[ts$user_name=='carlitos',])
+
+tr_charles <- preprocess(tr[tr$user_name=='charles',])
+ts_charles <- preprocess(ts[ts$user_name=='charles',])
+
+tr_eurico <- preprocess(tr[tr$user_name=='eurico',])
+ts_eurico <- preprocess(ts[ts$user_name=='eurico',])
+
+tr_jeremy <- preprocessJeremy(tr[tr$user_name=='jeremy',])
+ts_jeremy <- preprocessJeremy(ts[ts$user_name=='jeremy',])
+
+tr_pedro <- preprocess(tr[tr$user_name=='pedro',])
+ts_pedro <- preprocess(ts[ts$user_name=='pedro',])
+```
+
+## Training and Predicting
+
+We will try three machine learning algorithms suited for classification problems with discrete outcomes: rf, gbm, and lda.  
+
+We create a helper function that splits the data into training and test set for cross-validation, and prints out the confusion matrix with the expected out-of-sample error:
+
+```{r message=F}
+library(caret)
+library(doParallel)
+registerDoParallel(cores=4)
+
+modelAndPredict <- function(df, m, ...) {
+    set.seed(1234)
+    inTrain = createDataPartition(df$classe, p=3/4)[[1]]
+    trainset <- df[inTrain,]
+    testset <- df[-inTrain,]    
+    model <- train(classe ~ ., data=trainset, method=m, ...)
+    pred <- predict(model, testset)
+    print(confusionMatrix(pred, testset$classe))
+    model
+}
+```
+
+We will test the performance of these 3 algorithms using Adelmo's dataset:
+
+```{r cache=T}
+modrf_adelmo <- modelAndPredict(tr_adelmo, 'rf')
+modgbm_adelmo <- modelAndPredict(tr_adelmo, 'gbm')
+modlda_adelmo <- modelAndPredict(tr_adelmo, 'lda')
+```
+
+From the output, it seems that gbm has a much higher accuracy than lda, and a slightly higher accuracy than rf.  Hence, we will apply gbm to predict the results for the remaining test subjects:
+
+```{r cache=T}
+modgbm_carlitos <- modelAndPredict(tr_carlitos, 'gbm')
+```
+
+```{r cache=T}
+modgbm_charles <- modelAndPredict(tr_charles, 'gbm')
+```
+
+```{r cache=T}
+modgbm_eurico <- modelAndPredict(tr_eurico, 'gbm')
+```
+
+```{r cache=T}
+modgbm_jeremy <- modelAndPredict(tr_jeremy, 'gbm')
+```
+
+```{r cache=T}
+modgbm_pedro <- modelAndPredict(tr_pedro, 'gbm')
+```
+
+In all six models, the out-of-sample errors is expected to be lower than 2%! (lower bound of 95% CI accuracy is higher than 98% across all six models)
+
+Finally, we write the output of our predictions:
+
+```{r message=F}
+for(i in 1:nrow(ts)) {
+    # setup default factor variable
+    p <- tr$classe[1]
+    
+    u <- ts$user_name[i]
+    if(u=='adelmo') {
+        p <- predict(modgbm_adelmo, ts[i,])
+    }
+    else if(u=='carlitos') {
+        p <- predict(modgbm_carlitos, ts[i,])        
+    }
+    else if(u=='charles') {
+        p <- predict(modgbm_charles, ts[i,])
+    }
+    else if(u=='eurico') {
+        p <- predict(modgbm_eurico, ts[i,])
+    }
+    else if(u=='jeremy') {
+        p <- predict(modgbm_jeremy, ts[i,])
+    }
+    else if(u=='pedro') {
+        p <- predict(modgbm_pedro, ts[i,])
+    }
+    
+    filename = paste0("problem_id_",i,".txt")
+    write(as.character(p), file=filename)
+}
+```
